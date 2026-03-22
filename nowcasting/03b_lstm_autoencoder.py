@@ -103,11 +103,25 @@ print(f"Normal train rows available: {normal_train_count:,}")
 
 from pyspark.sql.functions import variance as spark_var
 
+# Exclude rows inside anomaly event windows from "normal" training data.
+# These rows have status_type_id==0 but actually contain fault behaviour.
+_events_pd = spark.table(f"`{CATALOG}`.`wind-farm-a-event-info`").toPandas()
+_anomaly_evts = _events_pd[_events_pd['event_label'] == 'anomaly']
+print(f"Anomaly event windows to exclude from training: {len(_anomaly_evts)}")
+
+_exclude = F.lit(False)
+for _, evt in _anomaly_evts.iterrows():
+    _exclude = _exclude | (
+        (F.col('asset_id') == int(evt['asset']))
+        & (F.col('id') >= int(evt['event_start_id']))
+        & (F.col('id') <= int(evt['event_end_id']))
+    )
+
 normal_train_spark = df_spark.filter(
-    (F.col('status_type_id') == 0) & (F.col('train_test') == 'train')
+    (F.col('status_type_id') == 0) & (F.col('train_test') == 'train') & ~_exclude
 )
 
-var_exprs = [spark_var(F.col(c)).alias(c) for c in all_feature_cols]
+var_exprs = [spark_var(F.col(c).cast("double")).alias(c) for c in all_feature_cols]
 var_row = normal_train_spark.select(var_exprs).first()
 
 variance_series = pd.Series(
@@ -173,13 +187,15 @@ def make_windows(df_turbine, feature_cols, window_size=WINDOW_SIZE, step=WINDOW_
 normal_train_pd = (
     df_spark
     .filter(
-        (F.col('status_type_id') == 0) & (F.col('train_test') == 'train')
+        (F.col('status_type_id') == 0)
+        & (F.col('train_test') == 'train')
+        & ~_exclude
     )
     .select(['asset_id', 'time_stamp', 'id'] + feature_cols)
     .orderBy('asset_id', 'time_stamp')
     .toPandas()
 )
-print(f"Normal train rows collected: {len(normal_train_pd):,}")
+print(f"Normal train rows collected (anomaly windows excluded): {len(normal_train_pd):,}")
 
 scaler = StandardScaler()
 scaler.fit(normal_train_pd[feature_cols].fillna(0))

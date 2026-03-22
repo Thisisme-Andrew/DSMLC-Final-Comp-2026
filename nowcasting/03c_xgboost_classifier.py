@@ -31,6 +31,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
     classification_report, f1_score,
     precision_score, recall_score,
+    average_precision_score,
 )
 from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import SMOTE
@@ -157,16 +158,26 @@ print(f"\nTraining matrix shape: {X_labeled.shape}")
 
 # CELL 5 — Class weights and SMOTE check
 
-class_weights = compute_class_weight(
-    'balanced', classes=np.unique(y_labeled), y=y_labeled)
-weight_dict = dict(zip(np.unique(y_labeled), class_weights))
-print(f"Class weights: {weight_dict}")
-
 n_neg = int((y_labeled == 0).sum())
 n_pos = int((y_labeled == 1).sum())
-scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+
+if n_neg > 0 and n_pos > 0:
+    class_weights = compute_class_weight(
+        'balanced', classes=np.array([0, 1]), y=y_labeled)
+    weight_dict = dict(zip([0, 1], class_weights))
+    scale_pos_weight_raw = n_neg / n_pos
+    # Cap imbalance ratio — very large values push near-1 scores on all rows (high FAR).
+    SCALE_POS_CAP = 6.0
+    scale_pos_weight = float(min(scale_pos_weight_raw, SCALE_POS_CAP))
+else:
+    weight_dict = {0: 1.0, 1: 1.0}
+    scale_pos_weight_raw = 1.0
+    scale_pos_weight = 1.0
+    print("WARNING: only one class present in labeled data")
+
+print(f"Class weights: {weight_dict}")
 print(f"Normal: {n_neg}, Anomaly: {n_pos}")
-print(f"scale_pos_weight: {scale_pos_weight:.2f}")
+print(f"scale_pos_weight (raw / capped): {scale_pos_weight_raw:.2f} / {scale_pos_weight:.2f}")
 
 min_class_count = min(n_neg, n_pos)
 USE_SMOTE = min_class_count < 10
@@ -182,7 +193,43 @@ X_sorted = X_labeled[time_order]
 y_sorted = y_labeled[time_order]
 fault_sorted = fault_labels[time_order]
 
-tscv = TimeSeriesSplit(n_splits=5, gap=20)
+# Hold out the last slice of time for threshold calibration (not used for training).
+# Tuning thresholds on training scores inflated FAR / broke precision.
+HOLDOUT_FRAC = 0.20
+MIN_RECALL_CAL = 0.75
+n_lab = len(X_sorted)
+holdout_start = max(50, int(n_lab * (1.0 - HOLDOUT_FRAC)))
+if holdout_start >= n_lab - 20:
+    holdout_start = int(n_lab * 0.85)
+X_fit = X_sorted[:holdout_start]
+y_fit = y_sorted[:holdout_start]
+fault_fit = fault_sorted[:holdout_start]
+X_cal = X_sorted[holdout_start:]
+y_cal = y_sorted[holdout_start:]
+print(f"\nTemporal split: fit rows={len(X_fit):,}  calibration rows={len(X_cal):,}")
+print(f"  Fit label balance: normal={(y_fit==0).sum():,}  anomaly={(y_fit==1).sum():,}")
+print(f"  Cal label balance: normal={(y_cal==0).sum():,}  anomaly={(y_cal==1).sum():,}")
+
+n_splits_cv = min(5, max(2, len(X_fit) // 200))
+tscv = TimeSeriesSplit(n_splits=n_splits_cv, gap=20)
+
+# Stronger regularization + slightly shallower trees → fewer spurious positives.
+def _xgb_l1_params():
+    return dict(
+        n_estimators=400,
+        max_depth=5,
+        learning_rate=0.05,
+        min_child_weight=4,
+        gamma=0.15,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        reg_lambda=2.5,
+        reg_alpha=0.3,
+        random_state=42,
+        scale_pos_weight=scale_pos_weight,
+        eval_metric='logloss',
+        verbosity=0,
+    )
 
 fold_metrics = []
 
@@ -195,22 +242,35 @@ with mlflow.start_run(run_name="xgb_level1_binary") as run:
     mlflow.log_param("n_normal", int((y_sorted == 0).sum()))
     mlflow.log_param("use_smote", USE_SMOTE)
     mlflow.log_param("scale_pos_weight", round(scale_pos_weight, 2))
+    mlflow.log_param("holdout_frac", HOLDOUT_FRAC)
+    mlflow.log_param("min_recall_cal", MIN_RECALL_CAL)
+    mlflow.log_param("fit_rows", len(X_fit))
+    mlflow.log_param("cal_rows", len(X_cal))
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_sorted)):
-        X_tr, X_val = X_sorted[train_idx], X_sorted[val_idx]
-        y_tr, y_val = y_sorted[train_idx], y_sorted[val_idx]
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_fit)):
+        X_tr, X_val = X_fit[train_idx], X_fit[val_idx]
+        y_tr, y_val = y_fit[train_idx], y_fit[val_idx]
 
-        if USE_SMOTE and y_tr.sum() > 0:
+        n_classes_tr = len(np.unique(y_tr))
+
+        if n_classes_tr < 2:
+            print(f"Fold {fold}: SKIPPED — training data has only "
+                  f"class {np.unique(y_tr)[0]} ({len(y_tr)} rows)")
+            fold_metrics.append({
+                'fold': fold, 'f1': 0.0,
+                'precision': 0.0, 'recall': 0.0,
+                'val_size': len(y_val),
+                'val_pos': int(y_val.sum()),
+            })
+            continue
+
+        if (USE_SMOTE and y_tr.sum() >= 2
+                and (y_tr == 0).sum() >= 2):
             k = min(3, int(y_tr.sum()) - 1)
             sm = SMOTE(k_neighbors=max(1, k), random_state=42)
             X_tr, y_tr = sm.fit_resample(X_tr, y_tr)
 
-        model = XGBClassifier(
-            n_estimators=200, max_depth=6,
-            learning_rate=0.05, random_state=42,
-            scale_pos_weight=scale_pos_weight,
-            eval_metric='logloss', verbosity=0,
-        )
+        model = XGBClassifier(**_xgb_l1_params())
         model.fit(X_tr, y_tr)
 
         preds = model.predict(X_val)
@@ -236,21 +296,22 @@ with mlflow.start_run(run_name="xgb_level1_binary") as run:
     mlflow.log_metric("mean_cv_f1", mean_f1)
     print(f"\nMean CV F1: {mean_f1:.3f}")
 
-    # Final model on ALL labeled data
-    if USE_SMOTE and y_sorted.sum() > 0:
-        k = min(3, int(y_sorted.sum()) - 1)
+    # Final model: fit ONLY on non-holdout rows (same distribution as deployment).
+    if (USE_SMOTE and y_fit.sum() >= 2
+            and (y_fit == 0).sum() >= 2):
+        k = min(3, int(y_fit.sum()) - 1)
         sm = SMOTE(k_neighbors=max(1, k), random_state=42)
-        X_final, y_final = sm.fit_resample(X_sorted, y_sorted)
+        X_final, y_final = sm.fit_resample(X_fit, y_fit)
     else:
-        X_final, y_final = X_sorted, y_sorted
+        X_final, y_final = X_fit, y_fit
 
-    xgb_l1 = XGBClassifier(
-        n_estimators=200, max_depth=6,
-        learning_rate=0.05, random_state=42,
-        scale_pos_weight=scale_pos_weight,
-        eval_metric='logloss', verbosity=0,
-    )
+    xgb_l1 = XGBClassifier(**_xgb_l1_params())
     xgb_l1.fit(X_final, y_final)
+
+    if len(y_cal) > 0 and len(np.unique(y_cal)) > 1:
+        cal_ap = average_precision_score(y_cal, xgb_l1.predict_proba(X_cal)[:, 1])
+        mlflow.log_metric("cal_pr_auc", cal_ap)
+        print(f"Calibration PR-AUC (holdout): {cal_ap:.4f}")
 
     mlflow.xgboost.log_model(xgb_l1, "xgb_level1")
 
@@ -271,11 +332,11 @@ with mlflow.start_run(run_name="xgb_level1_binary") as run:
 
 # COMMAND ----------
 
-# CELL 7 — Level 2: fault type classifier
+# CELL 7 — Level 2: fault type classifier (fit split only — no leakage into cal)
 
-anomaly_mask = y_sorted == 1
-X_anom = X_sorted[anomaly_mask]
-f_anom = fault_sorted[anomaly_mask]
+anomaly_mask = y_fit == 1
+X_anom = X_fit[anomaly_mask]
+f_anom = fault_fit[anomaly_mask]
 
 fault_types = sorted(np.unique(f_anom))
 fault_to_int = {f: i for i, f in enumerate(fault_types)}
@@ -296,8 +357,13 @@ if not HAS_L2:
 else:
     with mlflow.start_run(run_name="xgb_level2_faulttype"):
         xgb_l2 = XGBClassifier(
-            n_estimators=200, max_depth=4,
-            learning_rate=0.05, random_state=42,
+            n_estimators=300, max_depth=4,
+            learning_rate=0.05,
+            min_child_weight=2,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_lambda=1.5,
+            random_state=42,
             verbosity=0,
         )
         xgb_l2.fit(X_anom, y_fault)
@@ -316,7 +382,83 @@ else:
 
 # COMMAND ----------
 
-# CELL 8 — Score full dataframe per-turbine
+# CELL 8 — Threshold tuning and full-dataframe scoring
+
+# ── Step 1: Threshold on TIME HOLDOUT (reduces false alarms vs in-sample tuning) ──
+def _fbeta(prec, rec, beta=0.5):
+    """F-beta with beta<1 weights precision higher than recall."""
+    b2 = beta * beta
+    denom = b2 * prec + rec
+    if denom <= 0:
+        return 0.0
+    return (1.0 + b2) * prec * rec / denom
+
+
+if len(X_cal) < 40 or len(np.unique(y_cal)) < 2:
+    print("WARNING: calibration set small or single-class — "
+          "using full labeled set for threshold search.")
+    X_thr, y_thr = X_sorted, y_sorted
+else:
+    X_thr, y_thr = X_cal, y_cal
+
+cal_probs = xgb_l1.predict_proba(X_thr)[:, 1]
+
+threshold_grid = np.unique(np.clip(
+    np.concatenate([
+        np.linspace(0.35, 0.95, 80),
+        np.linspace(0.95, 0.999, 40),
+    ]),
+    0.0, 1.0,
+))
+
+threshold_results = []
+for thr in threshold_grid:
+    preds = (cal_probs > thr).astype(int)
+    _tp = int(((preds == 1) & (y_thr == 1)).sum())
+    _fn = int(((preds == 0) & (y_thr == 1)).sum())
+    _fp = int(((preds == 1) & (y_thr == 0)).sum())
+    _tn = int(((preds == 0) & (y_thr == 0)).sum())
+    _det  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0
+    _far  = _fp / (_fp + _tn) if (_fp + _tn) > 0 else 0
+    _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0
+    _f1   = 2 * _prec * _det / (_prec + _det) if (_prec + _det) > 0 else 0
+    _f05  = _fbeta(_prec, _det, beta=0.5)
+    threshold_results.append({
+        'threshold': thr, 'TP': _tp, 'FP': _fp, 'FN': _fn, 'TN': _tn,
+        'detection_rate': round(_det, 4),
+        'false_alarm_rate': round(_far, 4),
+        'precision': round(_prec, 4),
+        'f1': round(_f1, 4),
+        'f05': round(_f05, 4),
+    })
+
+thresh_df = pd.DataFrame(threshold_results)
+print("Threshold comparison on calibration (holdout) event-window rows:\n")
+disp_cols = ['threshold', 'detection_rate', 'false_alarm_rate',
+               'precision', 'f1', 'f05']
+print(thresh_df[disp_cols].to_string(index=False))
+
+# Prefer precision: among thresholds meeting min recall on cal, take highest precision.
+meet = thresh_df[thresh_df['detection_rate'] >= MIN_RECALL_CAL]
+if len(meet) > 0:
+    best_idx = meet['precision'].idxmax()
+    TUNED_THRESHOLD = float(meet.loc[best_idx, 'threshold'])
+    sel_reason = f"max precision subject to recall>={MIN_RECALL_CAL}"
+else:
+    best_idx = thresh_df['f05'].idxmax()
+    TUNED_THRESHOLD = float(thresh_df.loc[best_idx, 'threshold'])
+    sel_reason = "no threshold met min recall — max F0.5 on calibration"
+
+print(f"\nSelected threshold: {TUNED_THRESHOLD:.4f}  ({sel_reason})")
+
+thresh_csv = os.path.join(_tmpdir, "xgb_threshold_comparison.csv")
+thresh_df.to_csv(thresh_csv, index=False)
+with mlflow.start_run(run_id=xgb_run_id):
+    mlflow.log_artifact(thresh_csv)
+    mlflow.log_param("tuned_threshold", TUNED_THRESHOLD)
+    mlflow.log_param("threshold_strategy", sel_reason)
+
+# ── Step 2: Score full dataframe per-turbine ──────────────────────
 
 all_turbines = sorted(
     [r.asset_id for r in df_spark.select('asset_id').distinct().collect()]
@@ -339,7 +481,7 @@ for asset_id in all_turbines:
     X_turbine = turbine_pd[feature_cols].fillna(0).values
 
     probs = xgb_l1.predict_proba(X_turbine)[:, 1]
-    flags = (probs > 0.5).astype(int)
+    flags = (probs > TUNED_THRESHOLD).astype(int)
 
     turbine_scored = turbine_pd[
         ['asset_id', 'time_stamp', 'id',
@@ -375,8 +517,20 @@ for asset_id in all_turbines:
 df_scored = pd.concat(scored_parts, ignore_index=True)
 del scored_parts
 
+# ── Step 3: Continuous risk tier ──────────────────────────────────
+# xgb_anomaly_prob is the continuous risk metric (0–1).
+# xgb_risk_tier bins it into actionable categories.
+df_scored['xgb_risk_tier'] = pd.cut(
+    df_scored['xgb_anomaly_prob'],
+    bins=[-0.01, 0.3, 0.6, 0.9, 1.01],
+    labels=['low', 'medium', 'high', 'critical'],
+).astype(str)
+
 print(f"\nTotal scored rows:  {len(df_scored):,}")
-print(f"Total flagged:      {df_scored['xgb_anomaly_flag'].sum():,}")
+print(f"Total flagged (threshold={TUNED_THRESHOLD}):  "
+      f"{df_scored['xgb_anomaly_flag'].sum():,}")
+print(f"\nRisk tier distribution:")
+print(df_scored['xgb_risk_tier'].value_counts().to_string())
 print(f"\nFault type distribution (flagged rows):")
 print(df_scored[df_scored['xgb_anomaly_flag'] == 1]
     ['xgb_fault_type'].value_counts().to_string())
@@ -409,6 +563,25 @@ separation = (anomaly_val['xgb_anomaly_prob'].mean()
 direction = "OK" if separation > 0 else "WRONG"
 print(f"\nSeparation (anomaly - normal): {separation:.4f}  →  {direction}")
 
+# Compare default 0.5 vs tuned threshold on event windows
+for label, thr in [("default (0.5)", 0.5),
+                   (f"tuned ({TUNED_THRESHOLD})", TUNED_THRESHOLD)]:
+    a_flag = (anomaly_val['xgb_anomaly_prob'] > thr).astype(int)
+    n_flag = (normal_val['xgb_anomaly_prob'] > thr).astype(int)
+    _tp = int(a_flag.sum())
+    _fn = int((a_flag == 0).sum())
+    _fp = int(n_flag.sum())
+    _tn = int((n_flag == 0).sum())
+    _det  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0
+    _far  = _fp / (_fp + _tn) if (_fp + _tn) > 0 else 0
+    _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0
+    print(f"\n── Threshold: {label} ──")
+    print(f"  Detection rate (recall):  {_det:.4f}")
+    print(f"  False alarm rate:         {_far:.4f}")
+    print(f"  Precision:                {_prec:.4f}")
+    print(f"  TP={_tp}, FN={_fn}, FP={_fp}, TN={_tn}")
+
+# Metrics at the tuned threshold (used for MLflow)
 tp = int((anomaly_val['xgb_anomaly_flag'] == 1).sum())
 fn = int((anomaly_val['xgb_anomaly_flag'] == 0).sum())
 fp = int((normal_val['xgb_anomaly_flag'] == 1).sum())
@@ -418,10 +591,20 @@ det_rate = tp / (tp + fn) if (tp + fn) > 0 else 0
 fa_rate  = fp / (fp + tn) if (fp + tn) > 0 else 0
 precision = tp / (tp + fp) if (tp + fp) > 0 else 0
 
-print(f"\nDetection rate (recall):  {det_rate:.4f}")
-print(f"False alarm rate:         {fa_rate:.4f}")
-print(f"Precision:                {precision:.4f}")
-print(f"TP={tp}, FN={fn}, FP={fp}, TN={tn}")
+# Risk tier breakdown in event windows
+print(f"\n── Risk tier breakdown in event windows ──")
+print("Anomaly events:")
+print(pd.cut(
+    anomaly_val['xgb_anomaly_prob'],
+    bins=[-0.01, 0.3, 0.6, 0.9, 1.01],
+    labels=['low', 'medium', 'high', 'critical'],
+).value_counts().to_string())
+print("\nNormal events:")
+print(pd.cut(
+    normal_val['xgb_anomaly_prob'],
+    bins=[-0.01, 0.3, 0.6, 0.9, 1.01],
+    labels=['low', 'medium', 'high', 'critical'],
+).value_counts().to_string())
 
 # Per-fault-type detection
 if anomaly_val['xgb_anomaly_flag'].sum() > 0:
@@ -447,6 +630,7 @@ required_out = [
     'asset_id', 'time_stamp', 'id',
     'train_test', 'status_type_id',
     'xgb_anomaly_prob', 'xgb_anomaly_flag', 'xgb_fault_type',
+    'xgb_risk_tier',
 ]
 for col in required_out:
     if col not in df_scored.columns:
@@ -461,8 +645,10 @@ print("Output schema validated. No duplicate keys.")
 print(df_scored[required_out].dtypes)
 print(f"\nTotal rows: {len(df_scored):,}")
 print(f"Null counts:\n{df_scored[required_out].isnull().sum()}")
-print(f"\nFlag distribution:")
+print(f"\nFlag distribution (threshold={TUNED_THRESHOLD}):")
 print(df_scored['xgb_anomaly_flag'].value_counts().to_string())
+print(f"\nRisk tier distribution:")
+print(df_scored['xgb_risk_tier'].value_counts().to_string())
 
 # COMMAND ----------
 
@@ -487,3 +673,4 @@ print("\nAll required columns confirmed in Delta table.")
 
 saved.groupBy('xgb_anomaly_flag').count().show()
 saved.groupBy('xgb_fault_type').count().show()
+saved.groupBy('xgb_risk_tier').count().show()
