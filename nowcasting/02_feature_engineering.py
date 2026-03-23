@@ -156,6 +156,7 @@ for farm, cfg in FARM_CONFIG.items():
 
 # COMMAND ----------
 
+# DBTITLE 1,Compute rolling means stddev and deltas for sensor data
 # CELL 5 — Rolling features using Spark Window functions
 
 for farm in ['a', 'b', 'c']:

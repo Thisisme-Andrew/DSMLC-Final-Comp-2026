@@ -1,12 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 03c — XGBoost Classifier (Farm A)
-# MAGIC Supervised anomaly detection using event-window labels from `wind-farm-a-event-info`.
+# MAGIC # 03c — XGBoost Classifier (Farm C)
+# MAGIC Supervised anomaly detection using event-window labels from `wind-farm-c-event-info`.
 # MAGIC
 # MAGIC **Level 1** — Binary classifier (anomaly vs normal)
 # MAGIC **Level 2** — Fault type classifier (on anomaly rows only)
 # MAGIC
-# MAGIC **Output table contract** — `wind-farm-a-xgb-scores` must include:
+# MAGIC **Output table contract** — `workspace`.`wind-turbine-silver`.`wind-farm-c-xgb-scores` must include:
 # MAGIC `asset_id`, `time_stamp`, `id`, `train_test`, `status_type_id`,
 # MAGIC `xgb_anomaly_prob` (float), `xgb_fault_type` (string), `xgb_anomaly_flag` (int 0/1)
 
@@ -36,26 +36,117 @@ from sklearn.metrics import (
 from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import SMOTE
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 import pandas as pd, numpy as np
 import tempfile, os
+import gc
 import warnings; warnings.filterwarnings('ignore')
 
-CATALOG = "wind-turbine-silver"
+# Cap peak RAM during scoring (Farm C is large — driver OOM shows as "kernel unresponsive").
+PREDICT_CHUNK_ROWS = 50_000
+# Max rows per Spark collect; large turbines need chunking before toPandas().
+TO_PANDAS_CHUNK_ROWS = 125_000
+
+
+def _predict_proba_positive_chunked(model, X, chunk_rows: int = PREDICT_CHUNK_ROWS):
+    """predict_proba in row chunks — avoids a single huge XGBoost allocation."""
+    n = int(X.shape[0])
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    if n <= chunk_rows:
+        return model.predict_proba(X)[:, 1].astype(np.float64, copy=False)
+    parts = []
+    for start in range(0, n, chunk_rows):
+        end = min(start + chunk_rows, n)
+        parts.append(model.predict_proba(X[start:end])[:, 1])
+    return np.concatenate(parts, axis=0)
+
+
+def _predict_int_chunked(model, X, chunk_rows: int = PREDICT_CHUNK_ROWS):
+    if int(X.shape[0]) == 0:
+        return np.array([], dtype=np.int64)
+    if X.shape[0] <= chunk_rows:
+        return model.predict(X)
+    parts = []
+    for start in range(0, X.shape[0], chunk_rows):
+        end = min(start + chunk_rows, X.shape[0])
+        parts.append(model.predict(X[start:end]))
+    return np.concatenate(parts, axis=0)
+
+# Unity Catalog — features may live on competition share; event_info + scores often in workspace.
+FEATURE_CATALOG = "original-dcmlc-workspace"
+EVENT_INFO_CATALOG = "workspace"  # CSV-loaded event windows (matches SQL editor)
+OUTPUT_CATALOG = "workspace"
+SCHEMA = "wind-turbine-silver"
+
+
+def fq(name: str) -> str:
+    """Feature tables (e.g. wind-farm-c-features)."""
+    return f"`{FEATURE_CATALOG}`.`{SCHEMA}`.`{name}`"
+
+
+def fq_event_info(name: str) -> str:
+    """Event window labels — use workspace if share copy is missing/wrong labels."""
+    return f"`{EVENT_INFO_CATALOG}`.`{SCHEMA}`.`{name}`"
+
+
+def fq_out(name: str) -> str:
+    """Scored output (e.g. wind-farm-c-xgb-scores)."""
+    return f"`{OUTPUT_CATALOG}`.`{SCHEMA}`.`{name}`"
+
+
+def _normalize_events_for_xgb(ev: pd.DataFrame, table_fq: str) -> pd.DataFrame:
+    """Align event_info schema/types with features so labels and Spark filters match."""
+    out = ev.copy()
+    if "asset" in out.columns and "asset_id" not in out.columns:
+        out = out.rename(columns={"asset": "asset_id"})
+    need = ["asset_id", "event_start_id", "event_end_id", "event_label"]
+    miss = [c for c in need if c not in out.columns]
+    if miss:
+        raise ValueError(
+            f"{table_fq} missing columns {miss}; have {list(out.columns)}"
+        )
+    out["event_label_norm"] = (
+        out["event_label"].astype(str).str.strip().str.lower()
+    )
+    for c in ("asset_id", "event_start_id", "event_end_id"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    bad = (
+        out["asset_id"].isna()
+        | out["event_start_id"].isna()
+        | out["event_end_id"].isna()
+    )
+    if bad.any():
+        raise ValueError(
+            f"{table_fq}: non-numeric asset_id or id bounds:\n"
+            + out.loc[bad, need].to_string()
+        )
+    out["asset_id"] = out["asset_id"].astype(np.int64)
+    out["event_start_id"] = out["event_start_id"].astype(np.int64)
+    out["event_end_id"] = out["event_end_id"].astype(np.int64)
+    return out
+
+
 _tmpdir = tempfile.mkdtemp()
 
 mlflow.set_experiment(
     "/Users/"
     + spark.sql("SELECT current_user()").first()[0]
-    + "/DSMLC-Final-Comp-2026-xgboost-classifier"
+    + "/DSMLC-Final-Comp-2026-xgboost-classifier-farm-c"
 )
 
+print(
+    f"Features: {FEATURE_CATALOG}.{SCHEMA}  |  "
+    f"Event info: {EVENT_INFO_CATALOG}.{SCHEMA}  |  "
+    f"Write scores: {OUTPUT_CATALOG}.{SCHEMA}",
+)
 print(f"Temp directory: {_tmpdir}")
 
 # COMMAND ----------
 
 # CELL 3 — Load and validate
 
-df_spark = spark.table(f"`{CATALOG}`.`wind-farm-a-features`")
+df_spark = spark.table(fq("wind-farm-c-features"))
 
 required = ['asset_id', 'time_stamp', 'id', 'train_test', 'status_type_id']
 missing = [c for c in required if c not in df_spark.columns]
@@ -77,11 +168,24 @@ print(f"Total rows:       {df_spark.count():,}")
 print(f"Feature columns:  {len(feature_cols)}")
 print(f"Turbines:         {df_spark.select('asset_id').distinct().count()}")
 
-events = spark.table(f"`{CATALOG}`.`wind-farm-a-event-info`").toPandas()
-events = events.rename(columns={'asset': 'asset_id'})
+_evt_table = fq_event_info("wind-farm-c-event-info")
+events = _normalize_events_for_xgb(
+    spark.table(_evt_table).toPandas(),
+    _evt_table,
+)
+if len(events) == 0:
+    raise ValueError(f"{_evt_table} is empty — cannot train supervised XGBoost")
 
-print(f"\nEvents loaded: {len(events)}")
-print(events['event_label'].value_counts().to_string())
+n_anomaly_events = int((events["event_label_norm"] == "anomaly").sum())
+if n_anomaly_events == 0:
+    uniq = events["event_label"].dropna().unique().tolist()
+    raise ValueError(
+        f"{_evt_table} has no anomaly windows: after strip/lowercase no "
+        f"event_label equals 'anomaly'. Unique raw labels: {uniq}"
+    )
+
+print(f"\nEvents loaded: {len(events)}  (anomaly windows: {n_anomaly_events})")
+print(events["event_label"].value_counts().to_string())
 
 # COMMAND ----------
 
@@ -118,6 +222,18 @@ labeled_pd = (
 )
 print(f"Event-window rows collected: {len(labeled_pd):,}")
 
+if len(labeled_pd) == 0:
+    raise ValueError(
+        f"No feature rows fall inside any event window in {_evt_table}. "
+        "Check asset_id and event_start_id/event_end_id against "
+        "wind-farm-c-features (ids must overlap)."
+    )
+
+labeled_pd["asset_id"] = pd.to_numeric(labeled_pd["asset_id"], errors="coerce").astype(
+    np.int64
+)
+labeled_pd["id"] = pd.to_numeric(labeled_pd["id"], errors="coerce").astype(np.int64)
+
 # Step 3: Assign labels (anomaly=1 takes precedence over normal=0)
 labeled_pd['label'] = -1
 labeled_pd['fault_type'] = 'unlabeled'
@@ -128,7 +244,7 @@ for _, ev in events.iterrows():
         & (labeled_pd['id'] >= ev['event_start_id'])
         & (labeled_pd['id'] <= ev['event_end_id'])
     )
-    if ev['event_label'] == 'anomaly':
+    if ev['event_label_norm'] == 'anomaly':
         labeled_pd.loc[mask, 'label'] = 1
         labeled_pd.loc[mask, 'fault_type'] = ev.get(
             'event_description', 'anomaly')
@@ -137,16 +253,28 @@ for _, ev in events.iterrows():
         labeled_pd.loc[normal_mask, 'label'] = 0
         labeled_pd.loc[normal_mask, 'fault_type'] = 'normal'
 
+n_unlabeled = int((labeled_pd['label'] == -1).sum())
+n_before_drop = len(labeled_pd)
 labeled_pd = labeled_pd[labeled_pd['label'] >= 0].copy()
 
-print(f"\nLabeled rows: {len(labeled_pd):,}")
+print(f"\nLabeled rows: {len(labeled_pd):,}  (dropped {n_unlabeled:,} still -1 / out of band)")
 print(f"\nLabel distribution:")
 print(labeled_pd['label'].value_counts().to_string())
 print(f"\nFault type distribution:")
 print(labeled_pd['fault_type'].value_counts().to_string())
 
 if labeled_pd['label'].sum() == 0:
-    raise ValueError("No anomaly rows found — check event_info")
+    sample = events.head(min(5, len(events)))
+    raise ValueError(
+        "No anomaly rows found for training (label=1). "
+        f"Event windows in {_evt_table}: {len(events)}; "
+        f"marked anomaly: {n_anomaly_events}; "
+        f"feature rows inside any window: {n_before_drop:,}; "
+        f"rows with label still -1 after apply: {n_unlabeled:,}. "
+        "Often event_info uses different asset_id or id range than "
+        "wind-farm-c-features, or the share table differs from workspace copy. "
+        f"Sample events:\n{sample.to_string()}"
+    )
 
 X_labeled = labeled_pd[feature_cols].fillna(0).values
 y_labeled = labeled_pd['label'].values
@@ -309,7 +437,8 @@ with mlflow.start_run(run_name="xgb_level1_binary") as run:
     xgb_l1.fit(X_final, y_final)
 
     if len(y_cal) > 0 and len(np.unique(y_cal)) > 1:
-        cal_ap = average_precision_score(y_cal, xgb_l1.predict_proba(X_cal)[:, 1])
+        cal_ap = average_precision_score(
+            y_cal, _predict_proba_positive_chunked(xgb_l1, X_cal))
         mlflow.log_metric("cal_pr_auc", cal_ap)
         print(f"Calibration PR-AUC (holdout): {cal_ap:.4f}")
 
@@ -401,7 +530,7 @@ if len(X_cal) < 40 or len(np.unique(y_cal)) < 2:
 else:
     X_thr, y_thr = X_cal, y_cal
 
-cal_probs = xgb_l1.predict_proba(X_thr)[:, 1]
+cal_probs = _predict_proba_positive_chunked(xgb_l1, X_thr)
 
 threshold_grid = np.unique(np.clip(
     np.concatenate([
@@ -458,161 +587,239 @@ with mlflow.start_run(run_id=xgb_run_id):
     mlflow.log_param("tuned_threshold", TUNED_THRESHOLD)
     mlflow.log_param("threshold_strategy", sel_reason)
 
-# ── Step 2: Score full dataframe per-turbine ──────────────────────
+# ── Step 2–3: Score by chunk and append to Delta (no full df in driver RAM) ──
+# Concat of all turbines + pandas validation was a second OOM peak after scoring.
+
+required_out = [
+    'asset_id', 'time_stamp', 'id',
+    'train_test', 'status_type_id',
+    'xgb_anomaly_prob', 'xgb_anomaly_flag', 'xgb_fault_type',
+    'xgb_risk_tier',
+]
+
+META_COLS = [
+    'asset_id', 'time_stamp', 'id',
+    'train_test', 'status_type_id',
+]
+
+SCORES_TABLE_FQ = fq_out("wind-farm-c-xgb-scores")
+_scores_written = [False]
+
+_RISK_BINS = [-0.01, 0.3, 0.6, 0.9, 1.01]
+_RISK_LABELS = ['low', 'medium', 'high', 'critical']
+
+
+def _write_scored_chunk(pdf: pd.DataFrame) -> tuple[int, int]:
+    """Score one pandas chunk; append rows to Delta. Returns (n_rows, n_flagged)."""
+    X_t = pdf[feature_cols].fillna(0).to_numpy(dtype=np.float32, copy=False)
+    probs = _predict_proba_positive_chunked(xgb_l1, X_t)
+    flags = (probs > TUNED_THRESHOLD).astype(int)
+    part = pdf[META_COLS].copy()
+    part['xgb_anomaly_prob'] = probs
+    part['xgb_anomaly_flag'] = flags
+    if xgb_l2 is not None and flags.sum() > 0:
+        fault_preds = np.full(len(flags), 'normal', dtype=object)
+        anom_mask = flags == 1
+        ft_ints = _predict_int_chunked(xgb_l2, X_t[anom_mask])
+        fault_preds[anom_mask] = [
+            int_to_fault[int(i)] for i in ft_ints
+        ]
+        part['xgb_fault_type'] = fault_preds
+    elif flags.sum() > 0:
+        part['xgb_fault_type'] = np.where(
+            flags == 1, fault_types[0] if fault_types else 'unknown',
+            'normal',
+        )
+    else:
+        part['xgb_fault_type'] = 'normal'
+    part['xgb_risk_tier'] = pd.cut(
+        part['xgb_anomaly_prob'],
+        bins=_RISK_BINS,
+        labels=_RISK_LABELS,
+    ).astype(str)
+
+    sdf = spark.createDataFrame(part[required_out])
+    wr = sdf.write.format("delta").option("mergeSchema", "true")
+    if not _scores_written[0]:
+        wr.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+            SCORES_TABLE_FQ)
+        _scores_written[0] = True
+    else:
+        wr.mode("append").saveAsTable(SCORES_TABLE_FQ)
+
+    n_r, n_f = len(part), int(flags.sum())
+    del X_t, part, sdf
+    gc.collect()
+    return n_r, n_f
+
 
 all_turbines = sorted(
     [r.asset_id for r in df_spark.select('asset_id').distinct().collect()]
 )
 
-scored_parts = []
+total_rows_scored = 0
+total_flagged = 0
 
 for asset_id in all_turbines:
     print(f"Scoring turbine {asset_id} ...")
 
-    turbine_pd = (
+    turbine_sdf = (
         df_spark
         .filter(F.col('asset_id') == int(asset_id))
-        .select(['asset_id', 'time_stamp', 'id',
-                 'train_test', 'status_type_id'] + feature_cols)
+        .select(META_COLS + feature_cols)
         .orderBy('time_stamp')
-        .toPandas()
     )
+    n_rows = int(turbine_sdf.count())
+    if n_rows == 0:
+        continue
 
-    X_turbine = turbine_pd[feature_cols].fillna(0).values
-
-    probs = xgb_l1.predict_proba(X_turbine)[:, 1]
-    flags = (probs > TUNED_THRESHOLD).astype(int)
-
-    turbine_scored = turbine_pd[
-        ['asset_id', 'time_stamp', 'id',
-         'train_test', 'status_type_id']
-    ].copy()
-    turbine_scored['xgb_anomaly_prob'] = probs
-    turbine_scored['xgb_anomaly_flag'] = flags
-
-    if xgb_l2 is not None and flags.sum() > 0:
-        fault_preds = np.full(len(probs), 'normal', dtype=object)
-        anom_idx = np.where(flags == 1)[0]
-        ft_ints = xgb_l2.predict(X_turbine[anom_idx])
-        fault_preds[anom_idx] = [
-            int_to_fault[int(i)] for i in ft_ints
-        ]
-        turbine_scored['xgb_fault_type'] = fault_preds
-    elif flags.sum() > 0:
-        turbine_scored['xgb_fault_type'] = np.where(
-            flags == 1, fault_types[0] if fault_types else 'unknown',
-            'normal',
-        )
+    turbine_flagged = 0
+    if n_rows <= TO_PANDAS_CHUNK_ROWS:
+        pdf = turbine_sdf.toPandas()
+        nr, nf = _write_scored_chunk(pdf)
+        total_rows_scored += nr
+        total_flagged += nf
+        turbine_flagged += nf
+        del pdf
+        gc.collect()
     else:
-        turbine_scored['xgb_fault_type'] = 'normal'
+        print(f"  (chunked Spark→pandas, {n_rows:,} rows "
+              f"in slices of {TO_PANDAS_CHUNK_ROWS:,})")
+        w = Window.orderBy('time_stamp')
+        numbered = turbine_sdf.withColumn(
+            '_rn', F.row_number().over(w),
+        ).persist()
+        try:
+            for start in range(1, n_rows + 1, TO_PANDAS_CHUNK_ROWS):
+                end = min(start + TO_PANDAS_CHUNK_ROWS - 1, n_rows)
+                pdf = (
+                    numbered
+                    .filter((F.col('_rn') >= start) & (F.col('_rn') <= end))
+                    .drop('_rn')
+                    .toPandas()
+                )
+                nr, nf = _write_scored_chunk(pdf)
+                total_rows_scored += nr
+                total_flagged += nf
+                turbine_flagged += nf
+                del pdf
+                gc.collect()
+        finally:
+            numbered.unpersist()
 
-    scored_parts.append(turbine_scored)
+    print(f"  {asset_id}: {n_rows:,} rows, "
+          f"{turbine_flagged:,} flagged ({turbine_flagged/n_rows*100:.1f}%)")
 
-    n_flagged = int(flags.sum())
-    print(f"  {asset_id}: {len(turbine_pd):,} rows, "
-          f"{n_flagged:,} flagged ({n_flagged/len(turbine_pd)*100:.1f}%)")
+if not _scores_written[0]:
+    raise ValueError("No rows scored — check features table and turbines list")
 
-    del X_turbine, turbine_pd
+print(f"\nTotal scored rows (written to Delta):  {total_rows_scored:,}")
+print(f"Total flagged (threshold={TUNED_THRESHOLD}):  {total_flagged:,}")
 
-df_scored = pd.concat(scored_parts, ignore_index=True)
-del scored_parts
-
-# ── Step 3: Continuous risk tier ──────────────────────────────────
-# xgb_anomaly_prob is the continuous risk metric (0–1).
-# xgb_risk_tier bins it into actionable categories.
-df_scored['xgb_risk_tier'] = pd.cut(
-    df_scored['xgb_anomaly_prob'],
-    bins=[-0.01, 0.3, 0.6, 0.9, 1.01],
-    labels=['low', 'medium', 'high', 'critical'],
-).astype(str)
-
-print(f"\nTotal scored rows:  {len(df_scored):,}")
-print(f"Total flagged (threshold={TUNED_THRESHOLD}):  "
-      f"{df_scored['xgb_anomaly_flag'].sum():,}")
-print(f"\nRisk tier distribution:")
-print(df_scored['xgb_risk_tier'].value_counts().to_string())
-print(f"\nFault type distribution (flagged rows):")
-print(df_scored[df_scored['xgb_anomaly_flag'] == 1]
-    ['xgb_fault_type'].value_counts().to_string())
+saved = spark.table(SCORES_TABLE_FQ)
+print(f"\nRisk tier distribution (Spark):")
+saved.groupBy('xgb_risk_tier').count().orderBy('xgb_risk_tier').show(20, False)
+print(f"\nFault type distribution — flagged (Spark):")
+saved.filter(F.col('xgb_anomaly_flag') == 1).groupBy(
+    'xgb_fault_type').count().orderBy(F.desc('count')).show(50, False)
 
 # COMMAND ----------
 
-# CELL 9 — Validation against event windows
+# CELL 9 — Validation against event windows (Spark — no full pandas collect)
 
-df_val = df_scored.merge(
-    events[['asset_id', 'event_id', 'event_label',
-            'event_start_id', 'event_end_id', 'event_description']],
-    on='asset_id', how='inner',
+_ev_base = [
+    'asset_id', 'event_id', 'event_label',
+    'event_start_id', 'event_end_id',
+]
+_ev_pdf = events[_ev_base].copy()
+if 'event_description' in events.columns:
+    _ev_pdf['event_description'] = events['event_description']
+else:
+    _ev_pdf['event_description'] = ''
+ev_spark = spark.createDataFrame(_ev_pdf)
+
+s = saved.alias("s")
+e = ev_spark.alias("e")
+el = F.lower(F.trim(F.col("e.event_label")))
+
+joined = (
+    s.join(F.broadcast(e), F.col("s.asset_id") == F.col("e.asset_id"), "inner")
+    .filter(
+        (F.col("s.id") >= F.col("e.event_start_id"))
+        & (F.col("s.id") <= F.col("e.event_end_id"))
+    )
 )
-df_val['in_event'] = (
-    (df_val['id'] >= df_val['event_start_id'])
-    & (df_val['id'] <= df_val['event_end_id'])
-)
-df_val = df_val[df_val['in_event']].copy()
 
-anomaly_val = df_val[df_val['event_label'] == 'anomaly']
-normal_val  = df_val[df_val['event_label'] == 'normal']
+print("XGBoost anomaly probability by event label (event-window rows, Spark):")
+joined.groupBy(el.alias("event_label")).agg(
+    F.avg(F.col("s.xgb_anomaly_prob")).alias("mean_prob"),
+    F.stddev(F.col("s.xgb_anomaly_prob")).alias("std_prob"),
+    F.count(F.lit(1)).alias("cnt"),
+).orderBy("event_label").show(20, False)
 
-print("XGBoost anomaly probability by event label:")
-print(df_val.groupby('event_label')['xgb_anomaly_prob'].agg(
-    ['mean', 'std', 'count']
-))
-
-separation = (anomaly_val['xgb_anomaly_prob'].mean()
-              - normal_val['xgb_anomaly_prob'].mean())
+_r_an = joined.filter(el == "anomaly").select(
+    F.avg(F.col("s.xgb_anomaly_prob")).alias("m")).first()
+_r_no = joined.filter(el == "normal").select(
+    F.avg(F.col("s.xgb_anomaly_prob")).alias("m")).first()
+ma = None if _r_an is None or _r_an["m"] is None else float(_r_an["m"])
+mn = None if _r_no is None or _r_no["m"] is None else float(_r_no["m"])
+separation = float((ma or 0.0) - (mn or 0.0))
 direction = "OK" if separation > 0 else "WRONG"
 print(f"\nSeparation (anomaly - normal): {separation:.4f}  →  {direction}")
 
-# Compare default 0.5 vs tuned threshold on event windows
+anom_j = joined.filter(el == "anomaly")
+norm_j = joined.filter(el == "normal")
+
+
+def _window_metrics(thr: float):
+    tp = anom_j.filter(F.col("s.xgb_anomaly_prob") > thr).count()
+    fn = anom_j.filter(F.col("s.xgb_anomaly_prob") <= thr).count()
+    fp = norm_j.filter(F.col("s.xgb_anomaly_prob") > thr).count()
+    tn = norm_j.filter(F.col("s.xgb_anomaly_prob") <= thr).count()
+    det = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    return tp, fn, fp, tn, det, far, prec
+
+
 for label, thr in [("default (0.5)", 0.5),
                    (f"tuned ({TUNED_THRESHOLD})", TUNED_THRESHOLD)]:
-    a_flag = (anomaly_val['xgb_anomaly_prob'] > thr).astype(int)
-    n_flag = (normal_val['xgb_anomaly_prob'] > thr).astype(int)
-    _tp = int(a_flag.sum())
-    _fn = int((a_flag == 0).sum())
-    _fp = int(n_flag.sum())
-    _tn = int((n_flag == 0).sum())
-    _det  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0
-    _far  = _fp / (_fp + _tn) if (_fp + _tn) > 0 else 0
-    _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0
+    _tp, _fn, _fp, _tn, _det, _far, _prec = _window_metrics(thr)
     print(f"\n── Threshold: {label} ──")
     print(f"  Detection rate (recall):  {_det:.4f}")
     print(f"  False alarm rate:         {_far:.4f}")
     print(f"  Precision:                {_prec:.4f}")
     print(f"  TP={_tp}, FN={_fn}, FP={_fp}, TN={_tn}")
 
-# Metrics at the tuned threshold (used for MLflow)
-tp = int((anomaly_val['xgb_anomaly_flag'] == 1).sum())
-fn = int((anomaly_val['xgb_anomaly_flag'] == 0).sum())
-fp = int((normal_val['xgb_anomaly_flag'] == 1).sum())
-tn = int((normal_val['xgb_anomaly_flag'] == 0).sum())
+# Metrics at tuned threshold (model flag column)
+tp = anom_j.filter(F.col("s.xgb_anomaly_flag") == 1).count()
+fn = anom_j.filter(
+    (F.col("s.xgb_anomaly_flag") == 0)
+    | (F.col("s.xgb_anomaly_flag").isNull())
+).count()
+fp = norm_j.filter(F.col("s.xgb_anomaly_flag") == 1).count()
+tn = norm_j.filter(
+    (F.col("s.xgb_anomaly_flag") == 0)
+    | (F.col("s.xgb_anomaly_flag").isNull())
+).count()
 
-det_rate = tp / (tp + fn) if (tp + fn) > 0 else 0
-fa_rate  = fp / (fp + tn) if (fp + tn) > 0 else 0
-precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+det_rate = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+fa_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
 
-# Risk tier breakdown in event windows
-print(f"\n── Risk tier breakdown in event windows ──")
+print(f"\n── Risk tier breakdown in event windows (Spark) ──")
 print("Anomaly events:")
-print(pd.cut(
-    anomaly_val['xgb_anomaly_prob'],
-    bins=[-0.01, 0.3, 0.6, 0.9, 1.01],
-    labels=['low', 'medium', 'high', 'critical'],
-).value_counts().to_string())
-print("\nNormal events:")
-print(pd.cut(
-    normal_val['xgb_anomaly_prob'],
-    bins=[-0.01, 0.3, 0.6, 0.9, 1.01],
-    labels=['low', 'medium', 'high', 'critical'],
-).value_counts().to_string())
+anom_j.groupBy("s.xgb_risk_tier").count().orderBy("s.xgb_risk_tier").show(20, False)
+print("Normal events:")
+norm_j.groupBy("s.xgb_risk_tier").count().orderBy("s.xgb_risk_tier").show(20, False)
 
-# Per-fault-type detection
-if anomaly_val['xgb_anomaly_flag'].sum() > 0:
-    print("\nPer-fault-type detection rate:")
-    for ft in sorted(anomaly_val['event_description'].unique()):
-        ft_rows = anomaly_val[anomaly_val['event_description'] == ft]
-        ft_det = ft_rows['xgb_anomaly_flag'].mean()
-        print(f"  {ft}: {ft_det:.3f} ({ft_rows['xgb_anomaly_flag'].sum()}/{len(ft_rows)})")
+if tp + fn > 0:
+    print("\nPer-fault-type detection rate (Spark):")
+    anom_j.groupBy("e.event_description").agg(
+        F.avg(F.col("s.xgb_anomaly_flag").cast("double")).alias("det_rate"),
+        F.sum(F.col("s.xgb_anomaly_flag")).alias("n_flag"),
+        F.count(F.lit(1)).alias("n_rows"),
+    ).orderBy(F.desc("n_rows")).show(50, False)
 
 with mlflow.start_run(run_id=xgb_run_id):
     mlflow.log_metric("detection_rate", det_rate)
@@ -624,53 +831,45 @@ print("\nValidation metrics logged to MLflow.")
 
 # COMMAND ----------
 
-# CELL 10 — Output schema validation
+# CELL 10 — Output schema validation (Spark)
 
-required_out = [
-    'asset_id', 'time_stamp', 'id',
-    'train_test', 'status_type_id',
-    'xgb_anomaly_prob', 'xgb_anomaly_flag', 'xgb_fault_type',
-    'xgb_risk_tier',
-]
 for col in required_out:
-    if col not in df_scored.columns:
+    if col not in saved.columns:
         raise ValueError(f"Output missing required column: {col}")
 
-dupes = df_scored.duplicated(
-    subset=['asset_id', 'time_stamp', 'id']).sum()
-if dupes > 0:
-    raise ValueError(f"Duplicate keys in output: {dupes} rows")
+_dup_ct = (
+    saved.groupBy("asset_id", "time_stamp", "id")
+    .count()
+    .filter(F.col("count") > 1)
+    .count()
+)
+if _dup_ct > 0:
+    raise ValueError(f"Duplicate keys in output: {_dup_ct} key groups")
 
 print("Output schema validated. No duplicate keys.")
-print(df_scored[required_out].dtypes)
-print(f"\nTotal rows: {len(df_scored):,}")
-print(f"Null counts:\n{df_scored[required_out].isnull().sum()}")
+saved.printSchema()
+print(f"\nTotal rows: {saved.count():,}")
+print("Null counts (Spark):")
+_null_row = saved.select([
+    F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c)
+    for c in required_out
+]).first()
+print({c: int(_null_row[c]) for c in required_out})
 print(f"\nFlag distribution (threshold={TUNED_THRESHOLD}):")
-print(df_scored['xgb_anomaly_flag'].value_counts().to_string())
+saved.groupBy("xgb_anomaly_flag").count().orderBy("xgb_anomaly_flag").show()
 print(f"\nRisk tier distribution:")
-print(df_scored['xgb_risk_tier'].value_counts().to_string())
+saved.groupBy("xgb_risk_tier").count().orderBy("xgb_risk_tier").show(20, False)
 
 # COMMAND ----------
 
-# CELL 11 — Save to Delta
+# CELL 11 — Table already materialized in CELL 8 (incremental Delta writes)
 
-(
-    spark.createDataFrame(df_scored[required_out])
-    .write.format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(f"`{CATALOG}`.`wind-farm-a-xgb-scores`")
-)
-
-saved = spark.table(f"`{CATALOG}`.`wind-farm-a-xgb-scores`")
-print(f"Saved rows: {saved.count():,}")
-print(f"Columns:    {saved.columns}")
-
-assert 'xgb_anomaly_prob'  in saved.columns
-assert 'xgb_anomaly_flag'  in saved.columns
-assert 'xgb_fault_type'    in saved.columns
+print(f"Scores table: {SCORES_TABLE_FQ}")
+assert 'xgb_anomaly_prob' in saved.columns
+assert 'xgb_anomaly_flag' in saved.columns
+assert 'xgb_fault_type' in saved.columns
 print("\nAll required columns confirmed in Delta table.")
 
 saved.groupBy('xgb_anomaly_flag').count().show()
-saved.groupBy('xgb_fault_type').count().show()
-saved.groupBy('xgb_risk_tier').count().show()
+saved.groupBy('xgb_fault_type').count().show(50, False)
+saved.groupBy('xgb_risk_tier').count().show(20, False)
